@@ -1,3 +1,6 @@
+# Credentials (real passwords — never commit)
+appsettings.Development.json
+
 # Build output
 bin/
 obj/

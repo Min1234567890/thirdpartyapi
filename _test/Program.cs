@@ -17,6 +17,7 @@ using Oracle.ManagedDataAccess.Client;
 var config = new ConfigurationBuilder()
     .SetBasePath(Directory.GetCurrentDirectory())
     .AddJsonFile("../appsettings.json", optional: false)
+    .AddJsonFile("../appsettings.Development.json", optional: true)  // real credentials override
     .Build();
 
 string hvprx = config.GetConnectionString("HVPRX")!;
