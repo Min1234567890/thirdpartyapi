@@ -1,0 +1,200 @@
+# ThirdpartyAPI — REST API Reference
+
+**Base URL**: `http://<server>:5000/api`
+**Framework**: ASP.NET Core (.NET 10)
+**Hosting**: Kestrel (self-hosted) or IIS
+
+---
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/enrol` | Enrol a pass holder by NRIC/FIN/Passport + CSN |
+| `POST` | `/api/verify` | Trigger VPX hand vascular verification by ID |
+| `GET` | `/api/health` | Full system health: DB + XAgent + VPX devices |
+
+---
+
+## 1. POST /api/enrol
+
+### Request
+
+```json
+{
+    "idType": "NRIC",
+    "idNumber": "S1234567A",
+    "csn": "9E230EAA"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `idType` | string | Yes | `NRIC`, `FIN`, or `PASSPORT` |
+| `idNumber` | string | Yes | ID number (e.g. `S1234567A`) |
+| `csn` | string | Yes | 8-char hex CSN from QR code scan (e.g. `9E230EAA`) |
+
+### Responses
+
+**200 — SUCCESS**
+```json
+{
+    "result": "SUCCESS",
+    "csn": "9E230EAA",
+    "pin": "2653097642",
+    "devicePin": "03224F1187553FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "cardSerialNo": "JC00012345",
+    "name": "TAN AH KOW",
+    "idNumber": "S1234567A",
+    "userId": 1234
+}
+```
+
+**404 — USER_NOT_FOUND**
+```json
+{
+    "result": "USER_NOT_FOUND",
+    "csn": "ABCD1234",
+    "pin": "2882343476",
+    "devicePin": "032255E6891A3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "message": "No record found in JCMS for the provided ID."
+}
+```
+
+**422 — FAILURE**
+```json
+{
+    "result": "FAILURE",
+    "message": "This CSN/DevicePIN is already assigned to an active user."
+}
+```
+
+### Processing Flow
+
+```
+1. Validate idType, idNumber, csn
+2. Derive decimal PIN and 52-char DevicePIN from CSN
+3. Check DevicePIN not already in use (TUser)
+4. Look up cardholder in JCMS (JC_CARDDTL)
+5. INSERT TTask (Type=159) → XAgent → VPX enrols biometric
+6. Poll TTask until Status=3 (max 30s)
+7. Read TUser.Id (created by XAgent)
+8. INSERT TUser_Info (name, number)
+9. UPDATE JC_CARDDTL SET CSN_No = csn
+10. INSERT Enrolment_Log
+11. Return SUCCESS
+```
+
+---
+
+## 2. POST /api/verify
+
+### Request
+
+```json
+{
+    "idType": "NRIC",
+    "idNumber": "S1234567A"
+}
+```
+
+### Responses
+
+**200 — VERIFIED**
+```json
+{
+    "result": "VERIFIED",
+    "name": "TAN AH KOW",
+    "idNumber": "S1234567A",
+    "cardSerialNo": "JC00012345",
+    "csn": "9E230EAA",
+    "devicePin": "03224F1187553FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "verifyDetail": "Verification success"
+}
+```
+
+**404 — USER_NOT_FOUND** / **USER_NOT_ENROLLED**
+```json
+{
+    "result": "USER_NOT_ENROLLED",
+    "name": "NOT ENROLLED USER",
+    "cardSerialNo": "JC00088888",
+    "message": "User found in JCMS but not yet enrolled in SmartPass."
+}
+```
+
+**422 — NOT_VERIFIED**
+```json
+{
+    "result": "NOT_VERIFIED",
+    "name": "TAN AH KOW",
+    "verifyDetail": "Vascular mismatch",
+    "message": "Verification failed or timed out at the VPX."
+}
+```
+
+### Processing Flow
+
+```
+1. Look up in JCMS → if not found, USER_NOT_FOUND
+2. Find TUser by card_sn or ID number → if not found, USER_NOT_ENROLLED
+3. Build TTask Type 161: "0;DevicePIN;"
+4. Send to VPX via XAgent
+5. Read TEvent_InOut for result detail
+6. Return VERIFIED / NOT_VERIFIED
+```
+
+---
+
+## 3. GET /api/health
+
+### Response
+
+```json
+{
+    "timestamp": "2026-06-18 12:40:00",
+    "status": "healthy",
+    "databases": { "hvprx": "OK", "smartpass": "OK" },
+    "xagent": { "status": "OK", "agents": [...] },
+    "devices": {
+        "total": 4, "online": 4, "offline": 0, "status": "OK",
+        "list": [
+            { "id": 1, "name": "Main Gate L1", "ip": "192.168.110.2", "status": "ONLINE",
+              "testMode": "COMPLETE", "tamperSwitch": "CLOSED", "fireAlarm": false }
+        ]
+    }
+}
+```
+
+### Checks Performed
+
+| Layer | Source | What |
+|---|---|---|
+| Database | Direct connection | HVPRX + SmartPass connectivity |
+| XAgent | TAgent.Timestamp | Heartbeat < 5 min |
+| VPX Devices | TDevice | HeartBeat_Status, TestMode, Tamper, FireAlarm |
+
+---
+
+## CSN Derivation
+
+```
+8-hex CSN:     "9E230EAA"         ← from QR code
+Decimal PIN:   "2653097642"       ← uint32(csn, 16)
+52-char DP:    "03224F1187..."    ← Wiegand pipeline (SDK §1.4.2)
+```
+
+The DevicePIN format per NetControl-X SDK:
+- PinType(2) = `"03"` (Mifare card user)
+- WiegandBitLength(2) = `"22"` (0x22 = 34 bits = 32 data + 2 parity)
+- WiegandCode(48) = Hex10 padded with `'F'`
+
+## Error Codes
+
+| HTTP | `result` | Meaning |
+|---|---|---|
+| 200 | `SUCCESS` / `VERIFIED` | Operation completed |
+| 404 | `USER_NOT_FOUND` | ID not in JCMS |
+| 404 | `USER_NOT_ENROLLED` | In JCMS but not enrolled |
+| 422 | `FAILURE` | Validation error or system failure |
+| 422 | `NOT_VERIFIED` | VPX verification failed |

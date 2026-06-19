@@ -1,0 +1,17 @@
+# Build output
+bin/
+obj/
+
+# IDE
+.vs/
+*.suo
+*.user
+*.DotSettings
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test temp files
+_test/bin/
+_test/obj/

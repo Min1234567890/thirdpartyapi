@@ -1,0 +1,197 @@
+#nullable disable warnings
+using System;
+using Microsoft.Data.SqlClient;
+using System.Threading;
+using Microsoft.Extensions.Configuration;
+using ThirdpartyAPI.Models;
+
+namespace ThirdpartyAPI.Services;
+
+public class EnrolmentService
+{
+    private readonly string _hvprx, _smartPass;
+    private readonly int _vpxDeviceId;
+    private readonly JCMSLookup _jcms;
+    private const int CMD_USER_ENROLL = 159;
+    private const int STATUS_COMPLETE = 3;
+
+    public EnrolmentService(IConfiguration config)
+    {
+        _hvprx = config.GetConnectionString("HVPRX");
+        _smartPass = config.GetConnectionString("SmartPass");
+        _vpxDeviceId = int.Parse(config["VPX_DeviceId"] ?? "1");
+        _jcms = new JCMSLookup(config);
+    }
+
+    public EnrolmentResponse Enrol(EnrolmentRequest request)
+    {
+        // Validate
+        if (string.IsNullOrEmpty(request.IdType) || string.IsNullOrEmpty(request.IdNumber) || string.IsNullOrEmpty(request.Csn))
+            return Fail("idType, idNumber, and csn are all required.");
+
+        if (request.IdType.ToUpperInvariant() is not ("NRIC" or "FIN" or "PASSPORT"))
+            return Fail("idType must be NRIC, FIN, or PASSPORT.");
+
+        if (request.Csn.Length != 8)
+            return Fail("csn must be exactly 8 hex characters.");
+
+        if (!uint.TryParse(request.Csn, System.Globalization.NumberStyles.HexNumber, null, out _))
+            return Fail("csn is not a valid hex string.");
+
+        // Derive
+        string csn = request.Csn.ToUpperInvariant();
+        string pin = DevicePINConverter.CSNtoDecimalPIN(csn);
+        string dp = DevicePINConverter.CSNtoDevicePIN(csn);
+
+        // Duplicate check
+        if (IsDevicePinInUse(dp))
+            return new EnrolmentResponse { Result = "FAILURE", Csn = csn, Pin = pin, DevicePin = dp,
+                Message = "This CSN/DevicePIN is already assigned to an active user." };
+
+        // JCMS lookup
+        JCMSRecord rec;
+        try { rec = _jcms.LookupById(request.IdType, request.IdNumber); }
+        catch (Exception ex) { return Fail($"JCMS lookup error: {ex.Message}"); }
+
+        if (rec == null)
+            return new EnrolmentResponse { Result = "USER_NOT_FOUND", Csn = csn, Pin = pin, DevicePin = dp,
+                Message = "No record found in JCMS for the provided ID." };
+
+        // Build TTask InputData
+        string validFrom = DateTime.Now.ToString("yyyyMMddHHmmss");
+        string validTo = rec.ExpiryDate == DateTime.MaxValue ? "" : rec.ExpiryDate.ToString("yyyyMMddHHmmss");
+        string inputData = $"{dp};1;0;0;1;1;0;1;0;{validFrom};{validTo};;";
+
+        // Insert TTask
+        int taskId;
+        try { taskId = InsertTask(csn, inputData); }
+        catch (Exception ex) { return Ctx(csn, pin, dp, rec, $"Failed to create enrolment task: {ex.Message}"); }
+
+        // Poll
+        if (!PollTask(taskId, out string result, out string output))
+            return Ctx(csn, pin, dp, rec, $"VPX enrolment failed. Result: {result}. {output}");
+
+        // Read TUser
+        int userId;
+        try { userId = GetUserId(dp); }
+        catch (Exception ex) { return Ctx(csn, pin, dp, rec, $"Enrolled but failed to read TUser: {ex.Message}"); }
+
+        // TUser_Info + JCMS + Log
+        try { InsertUserInfo(userId, rec); } catch { }
+        try { UpdateJCMS(rec.CardSerialNo, csn); } catch { }
+        try { LogEnrolment(userId, csn, pin, dp, rec); } catch { }
+
+        return new EnrolmentResponse
+        {
+            Result = "SUCCESS", Csn = csn, Pin = pin, DevicePin = dp,
+            CardSerialNo = rec.CardSerialNo, Name = rec.CardHolderName,
+            IdNumber = rec.NricNo ?? rec.FinNo, UserId = userId
+        };
+    }
+
+    private int InsertTask(string csn, string inputData)
+    {
+        using var conn = new SqlConnection(_hvprx);
+        conn.Open();
+        using var cmd = new SqlCommand(
+            "INSERT INTO TTask (Type, Status, InputTime, InputData, Device_Id, CmdAccount) " +
+            "VALUES (@Type, 0, GETDATE(), @Data, @Dev, @Cmd); SELECT SCOPE_IDENTITY();", conn);
+        cmd.Parameters.AddWithValue("@Type", CMD_USER_ENROLL);
+        cmd.Parameters.AddWithValue("@Data", inputData);
+        cmd.Parameters.AddWithValue("@Dev", _vpxDeviceId);
+        cmd.Parameters.AddWithValue("@Cmd", $"ThirdpartyAPI_{csn}");
+        return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
+    private bool PollTask(int taskId, out string result, out string output)
+    {
+        result = ""; output = "";
+        for (int i = 0; i < 60; i++)
+        {
+            Thread.Sleep(500);
+            using var conn = new SqlConnection(_hvprx);
+            conn.Open();
+            using var cmd = new SqlCommand("SELECT Status, Result, OutputData FROM TTask WHERE Id = @Id", conn);
+            cmd.Parameters.AddWithValue("@Id", taskId);
+            using var r = cmd.ExecuteReader();
+            if (r.Read())
+            {
+                int status = Convert.ToInt32(r["Status"]);
+                if (status == STATUS_COMPLETE)
+                {
+                    result = r["Result"]?.ToString() ?? "";
+                    output = r["OutputData"]?.ToString() ?? "";
+                    return result == "0";
+                }
+                if (status == 2) { result = "CANCELLED"; return false; }
+            }
+        }
+        result = "TIMEOUT";
+        return false;
+    }
+
+    private bool IsDevicePinInUse(string dp)
+    {
+        using var conn = new SqlConnection(_hvprx);
+        conn.Open();
+        using var cmd = new SqlCommand("SELECT COUNT(1) FROM TUser WHERE DevicePIN = @dp AND DeleteDT IS NULL", conn);
+        cmd.Parameters.AddWithValue("@dp", dp);
+        return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
+    }
+
+    private int GetUserId(string dp)
+    {
+        using var conn = new SqlConnection(_hvprx);
+        conn.Open();
+        using var cmd = new SqlCommand("SELECT TOP 1 Id FROM TUser WHERE DevicePIN = @dp AND DeleteDT IS NULL ORDER BY Id DESC", conn);
+        cmd.Parameters.AddWithValue("@dp", dp);
+        var r = cmd.ExecuteScalar() ?? throw new Exception("User not found");
+        return Convert.ToInt32(r);
+    }
+
+    private void InsertUserInfo(int userId, JCMSRecord rec)
+    {
+        using var conn = new SqlConnection(_hvprx);
+        conn.Open();
+        using var cmd = new SqlCommand(
+            "INSERT INTO TUser_Info (User_Id, Name, FirstName, Number, Modify_DateTime) VALUES (@uid, @n, @fn, @num, GETDATE())", conn);
+        cmd.Parameters.AddWithValue("@uid", userId);
+        cmd.Parameters.AddWithValue("@n", rec.CardHolderName);
+        cmd.Parameters.AddWithValue("@fn", rec.CardHolderName);
+        string num = !string.IsNullOrEmpty(rec.NricNo) && rec.NricNo != "-" ? rec.NricNo :
+                     !string.IsNullOrEmpty(rec.FinNo) && rec.FinNo != "-" ? rec.FinNo : rec.PassportNo ?? "";
+        cmd.Parameters.AddWithValue("@num", num);
+        cmd.ExecuteNonQuery();
+    }
+
+    private void UpdateJCMS(string cardSN, string csn)
+    {
+        using var conn = new SqlConnection(_smartPass);
+        conn.Open();
+        using var cmd = new SqlCommand("UPDATE JC_CARDDTL SET CSN_No = @csn WHERE CARD_SERIALNO = @sn", conn);
+        cmd.Parameters.AddWithValue("@csn", csn);
+        cmd.Parameters.AddWithValue("@sn", cardSN);
+        cmd.ExecuteNonQuery();
+    }
+
+    private void LogEnrolment(int userId, string csn, string pin, string dp, JCMSRecord rec)
+    {
+        using var conn = new SqlConnection(_smartPass);
+        conn.Open();
+        using var cmd = new SqlCommand(
+            "INSERT INTO Enrolment_Log (Name, Number, Card_SN, EnrolDT, Executer, DevicePIN, PIN, Type) " +
+            "VALUES (@n, @num, @sn, GETDATE(), 'ThirdpartyAPI', @dp, @pin, 'QR_CODE')", conn);
+        cmd.Parameters.AddWithValue("@n", rec.CardHolderName);
+        cmd.Parameters.AddWithValue("@num", rec.NricNo ?? rec.FinNo ?? "");
+        cmd.Parameters.AddWithValue("@sn", rec.CardSerialNo);
+        cmd.Parameters.AddWithValue("@dp", dp);
+        cmd.Parameters.AddWithValue("@pin", pin);
+        cmd.ExecuteNonQuery();
+    }
+
+    private EnrolmentResponse Fail(string msg) => new() { Result = "FAILURE", Message = msg };
+
+    private EnrolmentResponse Ctx(string csn, string pin, string dp, JCMSRecord r, string msg) => new()
+    { Result = "FAILURE", Csn = csn, Pin = pin, DevicePin = dp,
+      CardSerialNo = r?.CardSerialNo, Name = r?.CardHolderName, IdNumber = r?.NricNo, Message = msg };
+}
