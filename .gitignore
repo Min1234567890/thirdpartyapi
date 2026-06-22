@@ -18,3 +18,4 @@ Thumbs.db
 # Test temp files
 _test/bin/
 _test/obj/
+*.rtf
