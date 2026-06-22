@@ -37,24 +37,63 @@ QR Scanner → ThirdpartyAPI (Kestrel/IIS) → TTask table → XAgent → VP-II 
 
 Input: idType (NRIC/FIN/PASSPORT) + idNumber only. No CSN required.
 
+#### Card Classification
+
+The API looks up ALL cards for the person (any status) and categorizes:
+
+| Category | Criteria |
+|---|---|
+| **Active unenrolled** | STATUS_CD IN (USE, SUS, SUSV) AND CSN_No IS NULL |
+| **Old enrolled** | CSN_No IS NOT NULL (any status, including EXP) |
+
+#### Enrolment Paths
+
+| Scenario | Action | TTask Type |
+|---|---|---|
+| No cards found | `USER_NOT_FOUND` | — |
+| All active cards already enrolled | `ALREADY_ENROLLED` | — |
+| Active unenrolled card + NO old enrolled card | **New enrolment** | 159 |
+| Active unenrolled card + old enrolled card exists | **CopyUser**: copy vascular template from old to new | **137** |
+
+#### Requirements
+
 | # | Requirement | Status |
 |---|---|---|
 | R1.1 | Accept idType (NRIC/FIN/PASSPORT), idNumber | ✓ |
-| R1.2 | Look up cardholder in JCMS by ID | ✓ |
-| R1.3 | If not found → USER_NOT_FOUND (200) | ✓ |
-| R1.4 | If multiple rows → take first | ✓ |
-| R1.5 | If CSN_No already set → ALREADY_ENROLLED (200) | ✓ |
-| R1.6 | Generate CSN from JCMS card serial (SHA256 hash) | ✓ |
-| R1.7 | Derive 52-char DevicePIN from CSN per SDK §1.4.2 | ✓ |
-| R1.8 | Check DevicePIN not already in TUser | ✓ |
-| R1.9 | TTask Type 159 with DevicePIN (SDK §3.17) | ✓ |
-| R1.10 | VPX/XAgent generates PIN → stored in TUser.PIN | ✓ |
-| R1.11 | Poll TTask completion (30s timeout) | ✓ |
-| R1.12 | Read PIN from TUser after XAgent creates it | ✓ |
-| R1.13 | Insert TUser_Info (API responsibility per SDK §2.4.2) | ✓ |
-| R1.14 | Update JCMS CSN_No | ✓ |
-| R1.15 | Log enrolment | ✓ |
-| R1.16 | Return SUCCESS with full details | ✓ |
+| R1.2 | Look up ALL cards for the person (any status) | ✓ |
+| R1.3 | If no cards → USER_NOT_FOUND | ✓ |
+| R1.4 | Identify active unenrolled card (target) | ✓ |
+| R1.5 | Identify old enrolled card (copy source) | ✓ |
+| R1.6 | If all active cards enrolled → ALREADY_ENROLLED | ✓ |
+| R1.7 | Generate CSN from card serial (SHA256 hash) | ✓ |
+| R1.8 | Derive 52-char DevicePIN from CSN per SDK §1.4.2 | ✓ |
+| R1.9 | Check DevicePIN not already in TUser | ✓ |
+
+**New Enrolment (no old card):**
+
+| # | Requirement | Status |
+|---|---|---|
+| R1.10a | TTask Type 159 per SDK §3.17 | ✓ |
+| R1.11a | XAgent creates TUser with PIN | ✓ |
+
+**CopyUser (old card exists):**
+
+| # | Requirement | Status |
+|---|---|---|
+| R1.10b | TTask Type 137: `<OldDP>;<NewDP>;` | ✓ |
+| R1.11b | VPX copies vascular template old→new | ✓ |
+| R1.12b | XAgent creates TUser for new DevicePIN | ✓ |
+
+**Post-enrolment (both paths):**
+
+| # | Requirement | Status |
+|---|---|---|
+| R1.13 | Poll TTask completion (30s timeout) | ✓ |
+| R1.14 | Read PIN from TUser (VPX/XAgent generated) | ✓ |
+| R1.15 | Insert TUser_Info per SDK §2.4.2 | ✓ |
+| R1.16 | Update JCMS CSN_No | ✓ |
+| R1.17 | Log enrolment | ✓ |
+| R1.18 | Return SUCCESS with full details | ✓ |
 
 ### R2 — Verification (POST /api/verify)
 
