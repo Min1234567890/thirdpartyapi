@@ -50,6 +50,7 @@ public class JCMSRecord
     public string CardHolderName { get; set; } = "";
     public string StatusCode { get; set; } = "";
     public DateTime ExpiryDate { get; set; }
+    public string CsnNo { get; set; } = "";
 }
 
 public class TUserRecord
