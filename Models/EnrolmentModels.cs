@@ -6,7 +6,6 @@ public class EnrolmentRequest
 {
     [JsonPropertyName("idType")]   public string IdType { get; set; } = "";
     [JsonPropertyName("idNumber")] public string IdNumber { get; set; } = "";
-    [JsonPropertyName("csn")]      public string Csn { get; set; } = "";
 }
 
 public class EnrolmentResponse

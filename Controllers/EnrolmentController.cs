@@ -29,7 +29,7 @@ public class EnrolmentController : ControllerBase
         return r.Result switch
         {
             "SUCCESS" => Ok(r),
-            "USER_NOT_FOUND" => NotFound(r),
+            "USER_NOT_FOUND" or "ALREADY_ENROLLED" => Ok(r),
             _ => UnprocessableEntity(r)
         };
     }
