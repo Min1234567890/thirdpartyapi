@@ -37,23 +37,29 @@ QR Scanner → ThirdpartyAPI (Kestrel/IIS) → TTask table → XAgent → VP-II 
 
 Input: idType (NRIC/FIN/PASSPORT) + idNumber only. No CSN required.
 
+#### Assumption
+
+**CSN is pre-assigned in JCMS before enrolment.** The API reads the CSN from
+`JC_CARDDTL.CSN_No` — it does NOT generate, derive, or write the CSN.
+
 #### Card Classification
 
 The API looks up ALL cards for the person (any status) and categorizes:
 
 | Category | Criteria |
 |---|---|
-| **Active unenrolled** | STATUS_CD IN (USE, SUS, SUSV) AND CSN_No IS NULL |
-| **Old enrolled** | CSN_No IS NOT NULL (any status, including EXP) |
+| **Target card** | STATUS_CD IN (USE, SUS, SUSV) AND CSN_No IS NOT NULL |
+| **Old enrolled** | CSN_No IS NOT NULL, different card (any status) |
 
 #### Enrolment Paths
 
 | Scenario | Action | TTask Type |
 |---|---|---|
 | No cards found | `USER_NOT_FOUND` | — |
-| All active cards already enrolled | `ALREADY_ENROLLED` | — |
-| Active unenrolled card + NO old enrolled card | **New enrolment** | 159 |
-| Active unenrolled card + old enrolled card exists | **CopyUser**: copy vascular template from old to new | **137** |
+| No active card with CSN assigned | `FAILURE` | — |
+| DevicePIN already in TUser | `ALREADY_ENROLLED` | — |
+| Target card + NO old enrolled card | **New enrolment** | 159 |
+| Target card + old enrolled card exists | **CopyUser**: copy template old→new | **137** |
 
 #### Requirements
 
@@ -62,12 +68,12 @@ The API looks up ALL cards for the person (any status) and categorizes:
 | R1.1 | Accept idType (NRIC/FIN/PASSPORT), idNumber | ✓ |
 | R1.2 | Look up ALL cards for the person (any status) | ✓ |
 | R1.3 | If no cards → USER_NOT_FOUND | ✓ |
-| R1.4 | Identify active unenrolled card (target) | ✓ |
-| R1.5 | Identify old enrolled card (copy source) | ✓ |
-| R1.6 | If all active cards enrolled → ALREADY_ENROLLED | ✓ |
-| R1.7 | Generate CSN from card serial (SHA256 hash) | ✓ |
-| R1.8 | Derive 52-char DevicePIN from CSN per SDK §1.4.2 | ✓ |
-| R1.9 | Check DevicePIN not already in TUser | ✓ |
+| R1.4 | Find active card with CSN_No pre-assigned | ✓ |
+| R1.5 | If no card has CSN → FAILURE (not ready for enrolment) | ✓ |
+| R1.6 | Read CSN from JCMS (API does NOT generate or write it) | ✓ |
+| R1.7 | Derive 52-char DevicePIN from CSN per SDK §1.4.2 | ✓ |
+| R1.8 | If DevicePIN in TUser → ALREADY_ENROLLED | ✓ |
+| R1.9 | Find old enrolled card for CopyUser | ✓ |
 
 **New Enrolment (no old card):**
 
@@ -91,9 +97,8 @@ The API looks up ALL cards for the person (any status) and categorizes:
 | R1.13 | Poll TTask completion (30s timeout) | ✓ |
 | R1.14 | Read PIN from TUser (VPX/XAgent generated) | ✓ |
 | R1.15 | Insert TUser_Info per SDK §2.4.2 | ✓ |
-| R1.16 | Update JCMS CSN_No | ✓ |
-| R1.17 | Log enrolment | ✓ |
-| R1.18 | Return SUCCESS with full details | ✓ |
+| R1.16 | Log enrolment | ✓ |
+| R1.17 | Return SUCCESS with full details | ✓ |
 
 ### R2 — Verification (POST /api/verify)
 

@@ -1,7 +1,5 @@
 #nullable disable warnings
 using System;
-using System.Security.Cryptography;
-using System.Text;
 using Microsoft.Data.SqlClient;
 using System.Threading;
 using Microsoft.Extensions.Configuration;
@@ -47,35 +45,28 @@ public class EnrolmentService
         // Categorize cards
         var activeCards = allCards.FindAll(c =>
             c.StatusCode == "USE" || c.StatusCode == "SUS" || c.StatusCode == "SUSV");
-        var enrolledCards = allCards.FindAll(c => !string.IsNullOrEmpty(c.CsnNo));
 
-        // Find: active card NOT yet enrolled (target for enrolment)
-        var targetCard = activeCards.Find(c => string.IsNullOrEmpty(c.CsnNo));
-
+        // Target: active card with CSN already assigned in JCMS
+        var targetCard = activeCards.Find(c => !string.IsNullOrEmpty(c.CsnNo));
         if (targetCard == null)
-        {
-            // All active cards are already enrolled
-            if (activeCards.Count > 0 && enrolledCards.Count > 0)
-                return new EnrolmentResponse { Result = "ALREADY_ENROLLED",
-                    Csn = enrolledCards[0].CsnNo, CardSerialNo = activeCards[0].CardSerialNo,
-                    Name = activeCards[0].CardHolderName,
-                    Message = "All active cards for this person are already enrolled." };
-            return new EnrolmentResponse { Result = "USER_NOT_FOUND",
-                Message = "No active unenrolled card found for this person." };
-        }
+            return new EnrolmentResponse { Result = "FAILURE",
+                Message = "No active card with a CSN assigned. CSN must be pre-assigned in JCMS before enrolment." };
 
-        // Find: old enrolled card (source for CopyUser template transfer)
-        var oldCard = enrolledCards.Find(c => c.CardSerialNo != targetCard.CardSerialNo);
+        // Read CSN from JCMS (already pre-assigned — API does NOT generate or write it)
+        string csn = targetCard.CsnNo;
+        string newDp = DevicePINConverter.CSNtoDevicePIN(csn);
 
-        // Generate CSN + DevicePIN for the new card
-        string newCsn = GenerateCSN(targetCard.CardSerialNo);
-        string newDp = DevicePINConverter.CSNtoDevicePIN(newCsn);
-
-        // Check DevicePIN not already in use
+        // Already enrolled? Check if this DevicePIN exists in TUser
         if (IsDevicePinInUse(newDp))
-            return new EnrolmentResponse { Result = "FAILURE", Csn = newCsn, DevicePin = newDp,
-                CardSerialNo = targetCard.CardSerialNo, Name = targetCard.CardHolderName,
-                Message = "DevicePIN collision — please retry." };
+            return new EnrolmentResponse { Result = "ALREADY_ENROLLED",
+                Csn = csn, DevicePin = newDp, CardSerialNo = targetCard.CardSerialNo,
+                Name = targetCard.CardHolderName,
+                Message = "This CSN/DevicePIN is already enrolled in the VPX system." };
+
+        // Find: old enrolled card (source for CopyUser if transferring template)
+        var oldEnrolledCards = allCards.FindAll(c =>
+            !string.IsNullOrEmpty(c.CsnNo) && c.CardSerialNo != targetCard.CardSerialNo);
+        var oldCard = oldEnrolledCards.FirstOrDefault();
 
         int userId; string pin;
         string personName = targetCard.CardHolderName;
@@ -83,70 +74,59 @@ public class EnrolmentService
 
         if (oldCard != null)
         {
-            // ── COPY USER FLOW: transfer vascular template from old to new card ──
+            // ── COPY USER: copy vascular template from old card to new card ──
             string oldCsn = oldCard.CsnNo;
             string oldDp = DevicePINConverter.CSNtoDevicePIN(oldCsn);
             string copyInput = $"{oldDp};{newDp};";
 
             int taskId;
-            try { taskId = InsertTask(CMD_COPY_USER, copyInput, newCsn); }
-            catch (Exception ex) { return Ctx(newCsn, newDp, targetCard,
+            try { taskId = InsertTask(CMD_COPY_USER, copyInput, csn); }
+            catch (Exception ex) { return Ctx(csn, newDp, targetCard,
                 $"Failed to create CopyUser task: {ex.Message}"); }
 
             if (!PollTask(taskId, out string result, out string output))
-                return Ctx(newCsn, newDp, targetCard,
+                return Ctx(csn, newDp, targetCard,
                     $"CopyUser failed. Result: {result}. {output}");
 
-            // Read TUser for the NEW DevicePIN (XAgent created it during copy)
             try { (userId, pin) = GetUserIdAndPin(newDp); }
-            catch (Exception ex) { return Ctx(newCsn, newDp, targetCard,
+            catch (Exception ex) { return Ctx(csn, newDp, targetCard,
                 $"CopyUser completed but failed to read TUser: {ex.Message}"); }
         }
         else
         {
-            // ── NEW USER ENROLMENT ──
+            // ── NEW ENROLMENT: TTask Type 159 ──
             string validFrom = DateTime.Now.ToString("yyyyMMddHHmmss");
             string validTo = targetCard.ExpiryDate == DateTime.MaxValue ? ""
                 : targetCard.ExpiryDate.ToString("yyyyMMddHHmmss");
             string inputData = $"{newDp};1;0;0;1;1;0;1;0;{validFrom};{validTo};;";
 
             int taskId;
-            try { taskId = InsertTask(CMD_USER_ENROLL, inputData, newCsn); }
-            catch (Exception ex) { return Ctx(newCsn, newDp, targetCard,
+            try { taskId = InsertTask(CMD_USER_ENROLL, inputData, csn); }
+            catch (Exception ex) { return Ctx(csn, newDp, targetCard,
                 $"Failed to create enrolment task: {ex.Message}"); }
 
             if (!PollTask(taskId, out string result, out string output))
-                return Ctx(newCsn, newDp, targetCard,
+                return Ctx(csn, newDp, targetCard,
                     $"VPX enrolment failed. Result: {result}. {output}");
 
             try { (userId, pin) = GetUserIdAndPin(newDp); }
-            catch (Exception ex) { return Ctx(newCsn, newDp, targetCard,
+            catch (Exception ex) { return Ctx(csn, newDp, targetCard,
                 $"Enrolled but failed to read TUser: {ex.Message}"); }
         }
 
-        // Post-enrolment: TUser_Info + JCMS update + log
+        // Post-enrolment: TUser_Info + log (CSN already in JCMS, no update needed)
         try { InsertUserInfo(userId, targetCard); } catch { }
-        try { UpdateJCMS(targetCard.CardSerialNo, newCsn); } catch { }
-        try { LogEnrolment(userId, newCsn, pin, newDp, targetCard); } catch { }
+        try { LogEnrolment(userId, csn, pin, newDp, targetCard); } catch { }
 
         return new EnrolmentResponse
         {
-            Result = "SUCCESS", Csn = newCsn, Pin = pin, DevicePin = newDp,
+            Result = "SUCCESS", Csn = csn, Pin = pin, DevicePin = newDp,
             CardSerialNo = targetCard.CardSerialNo, Name = personName,
             IdNumber = personId, UserId = userId,
             Message = oldCard != null
                 ? $"Vascular template copied from old card {oldCard.CardSerialNo}"
                 : ""
         };
-    }
-
-    /// <summary>Generate deterministic CSN from JCMS card serial number.</summary>
-    private static string GenerateCSN(string cardSerialNo)
-    {
-        using var sha = System.Security.Cryptography.SHA256.Create();
-        var hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(cardSerialNo));
-        uint val = BitConverter.ToUInt32(hash, 0);
-        return val.ToString("X8");
     }
 
     private int InsertTask(int cmdType, string inputData, string csn)
@@ -224,16 +204,6 @@ public class EnrolmentService
         string num = !string.IsNullOrEmpty(rec.NricNo) && rec.NricNo != "-" ? rec.NricNo :
                      !string.IsNullOrEmpty(rec.FinNo) && rec.FinNo != "-" ? rec.FinNo : rec.PassportNo ?? "";
         cmd.Parameters.AddWithValue("@num", num);
-        cmd.ExecuteNonQuery();
-    }
-
-    private void UpdateJCMS(string cardSN, string csn)
-    {
-        using var conn = new SqlConnection(_smartPass);
-        conn.Open();
-        using var cmd = new SqlCommand("UPDATE JC_CARDDTL SET CSN_No = @csn WHERE CARD_SERIALNO = @sn", conn);
-        cmd.Parameters.AddWithValue("@csn", csn);
-        cmd.Parameters.AddWithValue("@sn", cardSN);
         cmd.ExecuteNonQuery();
     }
 
